@@ -1,0 +1,1 @@
+BOT_TOKEN = "8865940736:AAGnU9JqWtLprvFkZqqE0sNwCZ-x01IuJP4"  # Get from @BotFather on Telegram
