@@ -7,7 +7,7 @@ DB_NAME = "game_library.db"
 GAME_COLUMNS = [
     "id", "user_id", "game_name", "store_url", "username", "password",
     "image_url", "purchase_date", "notes", "seller_contact", "price_paid",
-    "currency", "warranty_until", "is_favorite", "last_viewed",
+    "currency", "warranty_until", "is_favorite", "last_viewed", "store_id",
 ]
 
 
@@ -40,6 +40,7 @@ def _migrate_db(conn):
     _add_column_if_missing(conn, "games", "is_favorite", "INTEGER DEFAULT 0")
     _add_column_if_missing(conn, "games", "last_viewed", "TEXT")
     _add_column_if_missing(conn, "users", "reminders_enabled", "INTEGER DEFAULT 1")
+    _add_column_if_missing(conn, "games", "store_id", "INTEGER")
 
 
 def init_db():
@@ -54,6 +55,19 @@ def init_db():
             username TEXT,
             first_seen TEXT NOT NULL,
             reminders_enabled INTEGER DEFAULT 1
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS stores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL,
+            contact_info TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(telegram_id)
         )
         """
     )
@@ -118,19 +132,20 @@ def add_game(
     price_paid=None,
     currency="USD",
     warranty_until=None,
+    store_id=None,
 ):
     conn = _connect()
     conn.execute(
         """
         INSERT INTO games (
             user_id, game_name, store_url, username, password, image_url,
-            purchase_date, notes, seller_contact, price_paid, currency, warranty_until
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            purchase_date, notes, seller_contact, price_paid, currency, warranty_until, store_id
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             user_id, game_name, store_url, username, password, image_url,
             datetime.now().isoformat(), notes, seller_contact, price_paid,
-            currency, warranty_until,
+            currency, warranty_until, store_id,
         ),
     )
     conn.commit()
@@ -386,6 +401,79 @@ def export_user_games(user_id):
         FROM games WHERE user_id = ? ORDER BY id
         """,
         (user_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def add_store(user_id, name, url, contact_info=None):
+    conn = _connect()
+    cursor = conn.execute(
+        "INSERT INTO stores (user_id, name, url, contact_info) VALUES (?,?,?,?)",
+        (user_id, name, url, contact_info),
+    )
+    store_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return store_id
+
+
+def get_all_stores(user_id):
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, name, url, contact_info FROM stores WHERE user_id = ? ORDER BY name",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_store_by_id(user_id, store_id):
+    conn = _connect()
+    row = conn.execute(
+        "SELECT id, name, url, contact_info FROM stores WHERE user_id = ? AND id = ?",
+        (user_id, store_id),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_store(user_id, store_id, **fields):
+    allowed = {"name", "url", "contact_info"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return False
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    values = list(updates.values()) + [user_id, store_id]
+    conn = _connect()
+    conn.execute(
+        f"UPDATE stores SET {set_clause} WHERE user_id = ? AND id = ?",
+        values,
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def delete_store(user_id, store_id):
+    conn = _connect()
+    conn.execute(
+        "UPDATE games SET store_id = NULL WHERE user_id = ? AND store_id = ?",
+        (user_id, store_id),
+    )
+    conn.execute(
+        "DELETE FROM stores WHERE user_id = ? AND id = ?",
+        (user_id, store_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_games_by_store_id(user_id, store_id):
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, game_name FROM games WHERE user_id = ? AND store_id = ? ORDER BY game_name",
+        (user_id, store_id),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]

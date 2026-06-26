@@ -35,9 +35,11 @@ MENU_ADD = "➕ Add Game"
 MENU_QUICK_ADD = "⚡ Quick Add"
 MENU_LIBRARY = "📚 My Library"
 MENU_SEARCH = "🔍 Search"
+MENU_STORES = "🏪 Stores"
 MENU_STATS = "📊 My Stats"
 MENU_HELP = "❓ Help"
 MENU_HOME = "🏠 Menu"
+MENU_CANCEL = "❌ Cancel"
 
 # Add-game conversation states
 (
@@ -51,14 +53,24 @@ MENU_HOME = "🏠 Menu"
 # Quick-add conversation
 (QUICK_ADD_INPUT, QUICK_ADD_CONFIRM) = range(10, 12)
 
+# Store picker (within add-game flow)
+STORE_PICK = 12
+
+# Add-store conversation (standalone + sub-flow inside add-game)
+(STORE_NAME, STORE_URL_INPUT, STORE_CONTACT) = range(13, 16)
+
+# Edit-store conversation
+(STORE_EDIT_VALUE,) = range(16, 17)
+
 
 def main_menu_keyboard():
     return ReplyKeyboardMarkup(
         [
             [MENU_ADD, MENU_QUICK_ADD],
             [MENU_LIBRARY, MENU_SEARCH],
-            [MENU_STATS, MENU_HELP],
-            [MENU_HOME],
+            [MENU_STORES, MENU_STATS],
+            [MENU_HELP, MENU_HOME],
+            [MENU_CANCEL],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -68,9 +80,11 @@ def main_menu_keyboard():
 def menu_fallbacks():
     return [
         MessageHandler(filters.Regex(f"^{MENU_LIBRARY}$"), handle_menu_library),
+        MessageHandler(filters.Regex(f"^{MENU_STORES}$"), handle_menu_stores),
         MessageHandler(filters.Regex(f"^{MENU_STATS}$"), handle_menu_stats),
         MessageHandler(filters.Regex(f"^{MENU_HELP}$"), handle_menu_help),
         MessageHandler(filters.Regex(f"^{MENU_HOME}$"), handle_menu_home),
+        MessageHandler(filters.Text([MENU_CANCEL]), cancel_conversation),
         CommandHandler("cancel", cancel_conversation),
     ]
 
@@ -158,6 +172,37 @@ def format_warranty_status(warranty_until):
     if days_left == 0:
         return "Expires today"
     return f"Active ({days_left} days left)"
+
+
+def format_store_details(store, games):
+    lines = [
+        f"🏪 **{store['name']}**",
+        "━━━━━━━━━━━━━━━",
+        f"🔗 **URL:** {store['url']}",
+    ]
+    if store.get("contact_info"):
+        lines.append(f"📞 **Contact:** {store['contact_info']}")
+    lines.append("")
+    lines.append(f"🎮 **Linked Games ({len(games)}):**")
+    if games:
+        for g in games:
+            lines.append(f"   • {g['game_name']}")
+    else:
+        lines.append("   • None yet")
+    return "\n".join(lines)
+
+
+def build_store_detail_keyboard(store):
+    store_id = store["id"]
+    rows = []
+    if store["url"].startswith("http"):
+        rows.append([InlineKeyboardButton("🔗 Open Store", url=store["url"])])
+    rows.append([
+        InlineKeyboardButton("✏️ Edit", callback_data=f"store_edit_{store_id}"),
+        InlineKeyboardButton("🗑️ Delete", callback_data=f"store_del_{store_id}"),
+    ])
+    rows.append([InlineKeyboardButton("🔙 Back to Stores", callback_data="stores_list")])
+    return InlineKeyboardMarkup(rows)
 
 
 def format_game_details(game):
@@ -323,14 +368,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db.register_user(user.id, user.first_name, user.username)
 
-    inline = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add Game", callback_data="add")],
-        [InlineKeyboardButton("📚 My Library", callback_data="list")],
-        [InlineKeyboardButton("🔍 Search", callback_data="search")],
-        [InlineKeyboardButton("📊 My Stats", callback_data="stats")],
-        [InlineKeyboardButton("❓ Help", callback_data="help")],
-    ])
-
     await update.message.reply_text(
         f"🎮 **Welcome {user.first_name}!**\n\n"
         f"Your personal game library bot.\n"
@@ -339,7 +376,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu_keyboard(),
         parse_mode="Markdown",
     )
-    await update.message.reply_text("Quick actions:", reply_markup=inline)
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -390,6 +426,7 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def prompt_add_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_spam_action(context, "menu_add"):
         return ConversationHandler.END
+    await _delete_menu_message(update)
     await update.message.reply_text(
         "🎮 Send the **game name** or paste a **Steam store link**:",
         reply_markup=main_menu_keyboard(),
@@ -399,8 +436,15 @@ async def prompt_add_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def prompt_after_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Skip cover image step when Steam already provided one."""
+    """Skip cover image step when Steam already provided one. Skip seller when store is linked."""
     if context.user_data.get("image_url"):
+        if context.user_data.get("store_id"):
+            await update.message.reply_text(
+                "📝 **Notes** (2FA info, etc.) or /skip:",
+                reply_markup=main_menu_keyboard(),
+                parse_mode="Markdown",
+            )
+            return NOTES
         await update.message.reply_text(
             "🛒 **Seller contact** (Telegram @, Discord, etc.) or /skip:",
             reply_markup=main_menu_keyboard(),
@@ -431,23 +475,129 @@ async def add_game_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if context.user_data.get("image_url"):
                     filled.append("🖼️ Cover image loaded")
                 await update.message.reply_text(
-                    f"✅ Found on Steam:\n" + "\n".join(filled) + "\n\n"
-                    f"🔗 Send the **store URL** (where you bought it):",
+                    "✅ Found on Steam:\n" + "\n".join(filled),
                     reply_markup=main_menu_keyboard(),
                     parse_mode="Markdown",
                 )
-                return STORE_URL
         except Exception:
             pass
 
-    context.user_data.pop("from_steam", None)
-    context.user_data["game_name"] = text
+    if not context.user_data.get("game_name"):
+        context.user_data.pop("from_steam", None)
+        context.user_data["game_name"] = text
+
+    return await _prompt_store_picker(update, context)
+
+
+async def _prompt_store_picker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    stores = db.get_all_stores(user_id)
+
+    keyboard = []
+    for store in stores:
+        keyboard.append([InlineKeyboardButton(
+            f"🏪 {store['name']}",
+            callback_data=f"pick_store_{store['id']}",
+        )])
+    keyboard.append([
+        InlineKeyboardButton("➕ New Store", callback_data="pick_store_new"),
+        InlineKeyboardButton("✏️ Manual", callback_data="pick_store_manual"),
+    ])
+
+    header = "🏪 **Where did you buy it?**"
+    body = "\n\n_(No stores saved yet)_" if not stores else "\n\nPick a store or add one:"
     await update.message.reply_text(
-        "🔗 Send the **store URL** (where you bought it):",
+        header + body,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
+    )
+    return STORE_PICK
+
+
+async def store_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "pick_store_manual":
+        await query.edit_message_text(
+            "🔗 Send the **store URL** (where you bought it):",
+            parse_mode="Markdown",
+        )
+        return STORE_URL
+
+    if query.data == "pick_store_new":
+        await query.edit_message_text(
+            "🏪 **New Store** — send the store **name**:",
+            parse_mode="Markdown",
+        )
+        return STORE_NAME
+
+    store_id = int(query.data.rsplit("_", 1)[1])
+    store = db.get_store_by_id(update.effective_user.id, store_id)
+    if not store:
+        await query.edit_message_text("❌ Store not found. Try again.")
+        return STORE_PICK
+
+    context.user_data["store_url"] = store["url"]
+    context.user_data["seller_contact"] = store.get("contact_info")
+    context.user_data["store_id"] = store["id"]
+
+    await query.edit_message_text(
+        f"✅ Store: **{store['name']}**\n\n👤 Send the **Steam username or email**:",
+        parse_mode="Markdown",
+    )
+    return USERNAME
+
+
+# New-store sub-flow within the add-game conversation
+
+async def game_add_new_store_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["_ns_name"] = update.message.text.strip()
+    await update.message.reply_text(
+        "🔗 Send the store **URL**:",
         reply_markup=main_menu_keyboard(),
         parse_mode="Markdown",
     )
-    return STORE_URL
+    return STORE_URL_INPUT
+
+
+async def game_add_new_store_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["_ns_url"] = update.message.text.strip()
+    await update.message.reply_text(
+        "📞 **Contact info** (Telegram @, Discord, etc.) or /skip:",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown",
+    )
+    return STORE_CONTACT
+
+
+async def game_add_new_store_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["_ns_contact"] = update.message.text.strip()
+    return await _finish_game_add_store(update, context)
+
+
+async def game_add_new_store_skip_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["_ns_contact"] = None
+    return await _finish_game_add_store(update, context)
+
+
+async def _finish_game_add_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    name = context.user_data.pop("_ns_name")
+    url = context.user_data.pop("_ns_url")
+    contact = context.user_data.pop("_ns_contact", None)
+
+    store_id = db.add_store(user_id, name, url, contact)
+    context.user_data["store_url"] = url
+    context.user_data["seller_contact"] = contact
+    context.user_data["store_id"] = store_id
+
+    await update.message.reply_text(
+        f"✅ Store **{name}** saved!\n\n👤 Send the **Steam username or email**:",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown",
+    )
+    return USERNAME
 
 
 async def add_store_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -485,6 +635,13 @@ async def add_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["image_url"] = f"{TG_FILE_PREFIX}{update.message.photo[-1].file_id}"
     else:
         context.user_data["image_url"] = update.message.text
+    if context.user_data.get("store_id"):
+        await update.message.reply_text(
+            "📝 **Notes** (2FA info, etc.) or /skip:",
+            reply_markup=main_menu_keyboard(),
+            parse_mode="Markdown",
+        )
+        return NOTES
     await update.message.reply_text(
         "🛒 **Seller contact** (Telegram @, Discord, etc.) or /skip:",
         reply_markup=main_menu_keyboard(),
@@ -495,6 +652,13 @@ async def add_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def skip_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.setdefault("image_url", None)
+    if context.user_data.get("store_id"):
+        await update.message.reply_text(
+            "📝 **Notes** or /skip:",
+            reply_markup=main_menu_keyboard(),
+            parse_mode="Markdown",
+        )
+        return NOTES
     await update.message.reply_text(
         "🛒 **Seller contact** or /skip:",
         reply_markup=main_menu_keyboard(),
@@ -506,50 +670,6 @@ async def skip_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def add_seller(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["seller_contact"] = update.message.text
     await update.message.reply_text(
-        "💰 **Price paid** (e.g. 15.99) or /skip:",
-        reply_markup=main_menu_keyboard(),
-        parse_mode="Markdown",
-    )
-    return PRICE
-
-
-async def skip_seller(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["seller_contact"] = None
-    await update.message.reply_text(
-        "💰 **Price paid** (e.g. 15.99) or /skip:",
-        reply_markup=main_menu_keyboard(),
-        parse_mode="Markdown",
-    )
-    return PRICE
-
-
-async def add_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        context.user_data["price_paid"] = float(update.message.text.replace("$", "").strip())
-        context.user_data["currency"] = "USD"
-    except ValueError:
-        context.user_data["price_paid"] = None
-    await update.message.reply_text(
-        "🛡️ **Warranty end date** (YYYY-MM-DD) or /skip:",
-        reply_markup=main_menu_keyboard(),
-        parse_mode="Markdown",
-    )
-    return WARRANTY
-
-
-async def skip_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["price_paid"] = None
-    await update.message.reply_text(
-        "🛡️ **Warranty end date** (YYYY-MM-DD) or /skip:",
-        reply_markup=main_menu_keyboard(),
-        parse_mode="Markdown",
-    )
-    return WARRANTY
-
-
-async def add_warranty(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["warranty_until"] = update.message.text.strip()
-    await update.message.reply_text(
         "📝 **Notes** (2FA info, etc.) or /skip:",
         reply_markup=main_menu_keyboard(),
         parse_mode="Markdown",
@@ -557,8 +677,9 @@ async def add_warranty(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return NOTES
 
 
-async def skip_warranty(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["warranty_until"] = None
+async def skip_seller(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("seller_contact"):
+        context.user_data["seller_contact"] = None
     await update.message.reply_text(
         "📝 **Notes** or /skip:",
         reply_markup=main_menu_keyboard(),
@@ -594,6 +715,7 @@ async def save_game(update: Update, context):
         ud.get("price_paid"),
         ud.get("currency", "USD"),
         ud.get("warranty_until"),
+        ud.get("store_id"),
     )
     await update.message.reply_text(
         f"✅ **Game added!**\n\n🎮 {ud['game_name']}\n"
@@ -608,6 +730,7 @@ async def save_game(update: Update, context):
 async def prompt_quick_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_spam_action(context, "menu_quick_add"):
         return ConversationHandler.END
+    await _delete_menu_message(update)
     await update.message.reply_text(
         "⚡ **Quick Add** — paste a block like:\n\n"
         "```\n"
@@ -919,6 +1042,7 @@ async def delete_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def prompt_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_spam_action(context, "menu_search"):
         return ConversationHandler.END
+    await _delete_menu_message(update)
     await update.message.reply_text(
         "🔍 Send a **keyword** (game, store, seller, username, notes):",
         reply_markup=main_menu_keyboard(),
@@ -976,7 +1100,7 @@ async def show_help(query):
         "📋 **Copy User/Pass** — one-tap on game details\n\n"
         "**Commands:**\n"
         "/start /add /mylibrary /view /search /stats\n"
-        "/export /import /reminders on|off\n\n"
+        "/export /import /reminders on|off /clear\n\n"
         "⚠️ Your data is private per user."
     )
     markup = InlineKeyboardMarkup([
@@ -999,34 +1123,269 @@ async def reply_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _delete_menu_message(update: Update):
+    try:
+        await update.message.delete()
+    except BadRequest:
+        pass
+
+
 async def handle_menu_library(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _delete_menu_message(update)
     await reply_library(update, context, update.effective_user.id)
     return ConversationHandler.END
 
 
 async def handle_menu_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _delete_menu_message(update)
     await reply_stats(update, context, update.effective_user.id)
     return ConversationHandler.END
 
 
 async def handle_menu_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _delete_menu_message(update)
     await reply_help(update, context)
     return ConversationHandler.END
 
 
 async def handle_menu_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _delete_menu_message(update)
     await reply_menu(update, context)
     return ConversationHandler.END
 
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _delete_menu_message(update)
     await update.message.reply_text(
         "❌ Cancelled.", reply_markup=main_menu_keyboard()
     )
     return ConversationHandler.END
 
 
+# ─── Stores ──────────────────────────────────────────────────────────────────
+
+def _stores_keyboard(stores, user_id=None):
+    keyboard = []
+    for store in stores:
+        keyboard.append([InlineKeyboardButton(f"🏪 {store['name']}", callback_data=f"store_view_{store['id']}")])
+    keyboard.append([InlineKeyboardButton("➕ Add Store", callback_data="store_add")])
+    keyboard.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="menu")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _stores_text(stores):
+    if stores:
+        return f"🏪 **Your Stores** ({len(stores)} saved)\n\nTap a store to manage it:"
+    return "🏪 **No stores saved yet.**\n\nAdd your first store:"
+
+
+async def show_stores(query, context, user_id):
+    stores = db.get_all_stores(user_id)
+    await safe_edit_or_send(query, _stores_text(stores), _stores_keyboard(stores))
+
+
+async def reply_stores(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id):
+    stores = db.get_all_stores(user_id)
+    await send_or_edit_panel(
+        update, context, "menu_stores",
+        _stores_text(stores),
+        reply_markup=_stores_keyboard(stores),
+    )
+
+
+async def handle_menu_stores(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _delete_menu_message(update)
+    await reply_stores(update, context, update.effective_user.id)
+    return ConversationHandler.END
+
+
+async def stores_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if await debounce_query(query, context, "cb_stores_list"):
+        return
+    await show_stores(query, context, update.effective_user.id)
+
+
+async def view_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    store_id = int(query.data.rsplit("_", 1)[1])
+    if await debounce_query(query, context, f"cb_store_view_{store_id}"):
+        return
+    user_id = update.effective_user.id
+    store = db.get_store_by_id(user_id, store_id)
+    if not store:
+        await safe_edit_or_send(query, "❌ Store not found.")
+        return
+    games = db.get_games_by_store_id(user_id, store_id)
+    await safe_edit_or_send(query, format_store_details(store, games), build_store_detail_keyboard(store))
+
+
+# ─── Store add (standalone) ───────────────────────────────────────────────────
+
+async def store_add_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if await debounce_query(query, context, "cb_store_add"):
+        return ConversationHandler.END
+    await query.edit_message_text("🏪 **New Store** — send the store **name**:", parse_mode="Markdown")
+    return STORE_NAME
+
+
+async def store_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["_ns_name"] = update.message.text.strip()
+    await update.message.reply_text(
+        "🔗 Send the store **URL**:",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown",
+    )
+    return STORE_URL_INPUT
+
+
+async def store_add_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["_ns_url"] = update.message.text.strip()
+    await update.message.reply_text(
+        "📞 **Contact info** (Telegram @, Discord, etc.) or /skip:",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown",
+    )
+    return STORE_CONTACT
+
+
+async def store_add_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["_ns_contact"] = update.message.text.strip()
+    return await _save_new_store(update, context)
+
+
+async def store_add_skip_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["_ns_contact"] = None
+    return await _save_new_store(update, context)
+
+
+async def _save_new_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    name = context.user_data.pop("_ns_name")
+    url = context.user_data.pop("_ns_url")
+    contact = context.user_data.pop("_ns_contact", None)
+    db.add_store(user_id, name, url, contact)
+    await update.message.reply_text(
+        f"✅ **{name}** added to your stores!\n\nTap **Stores** to manage them.",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
+# ─── Store edit ───────────────────────────────────────────────────────────────
+
+STORE_EDIT_FIELDS = {
+    "name": ("name", "store name"),
+    "url": ("url", "store URL"),
+    "contact": ("contact_info", "contact info"),
+}
+
+
+async def store_edit_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    store_id = int(query.data.rsplit("_", 1)[1])
+    if await debounce_query(query, context, f"cb_store_edit_{store_id}"):
+        return
+    context.user_data["edit_store_id"] = store_id
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Name", callback_data="store_editf_name"),
+            InlineKeyboardButton("URL", callback_data="store_editf_url"),
+            InlineKeyboardButton("Contact", callback_data="store_editf_contact"),
+        ],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"store_view_{store_id}")],
+    ])
+    await safe_edit_or_send(query, "✏️ **What do you want to edit?**", keyboard)
+
+
+async def store_edit_start_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    field_key = query.data.replace("store_editf_", "")
+    if await debounce_query(query, context, f"cb_store_editf_{field_key}"):
+        return ConversationHandler.END
+    _, label = STORE_EDIT_FIELDS[field_key]
+    context.user_data["edit_store_field_key"] = field_key
+    await query.message.reply_text(
+        f"Send new **{label}**:",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown",
+    )
+    return STORE_EDIT_VALUE
+
+
+async def store_edit_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    store_id = context.user_data["edit_store_id"]
+    field_key = context.user_data["edit_store_field_key"]
+    db_field, label = STORE_EDIT_FIELDS[field_key]
+    db.update_store(user_id, store_id, **{db_field: update.message.text.strip()})
+    store = db.get_store_by_id(user_id, store_id)
+    games = db.get_games_by_store_id(user_id, store_id)
+    await update.message.reply_text(
+        f"✅ Updated **{label}**!",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown",
+    )
+    await update.message.reply_text(
+        format_store_details(store, games),
+        reply_markup=build_store_detail_keyboard(store),
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
+# ─── Store delete ─────────────────────────────────────────────────────────────
+
+async def delete_store_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    store_id = int(query.data.rsplit("_", 1)[1])
+    if await debounce_query(query, context, f"cb_store_del_{store_id}"):
+        return
+    user_id = update.effective_user.id
+    store = db.get_store_by_id(user_id, store_id)
+    linked = db.get_games_by_store_id(user_id, store_id)
+    warning = f"\n\n⚠️ **{len(linked)} game(s)** will be unlinked." if linked else ""
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes, delete", callback_data=f"store_delok_{store_id}"),
+        InlineKeyboardButton("❌ Cancel", callback_data=f"store_view_{store_id}"),
+    ]])
+    await safe_edit_or_send(query, f"🗑️ Delete **{store['name']}**?{warning}", keyboard)
+
+
+async def delete_store_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    store_id = int(query.data.rsplit("_", 1)[1])
+    if await debounce_query(query, context, f"cb_store_delok_{store_id}"):
+        return
+    db.delete_store(update.effective_user.id, store_id)
+    await show_stores(query, context, update.effective_user.id)
+
+
 # ─── Commands ─────────────────────────────────────────────────────────────────
+
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    msg_id = context.user_data.get("_panel_msg_id")
+    if msg_id:
+        try:
+            await context.bot.delete_message(chat_id, msg_id)
+        except BadRequest:
+            pass
+    try:
+        await update.message.delete()
+    except BadRequest:
+        pass
+    context.user_data.clear()
+    user = update.effective_user
+    await context.bot.send_message(
+        chat_id,
+        f"🎮 **Welcome back, {user.first_name}!**\n\nChat cleared. Use the menu below:",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown",
+    )
+
 
 async def mylibrary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply_library(update, context, update.effective_user.id)
@@ -1223,7 +1582,15 @@ def main():
         ],
         states={
             GAME_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_game_name)],
+            STORE_PICK: [CallbackQueryHandler(store_pick_cb, pattern="^pick_store")],
             STORE_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_store_url)],
+            # New-store sub-flow within the add-game conversation
+            STORE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, game_add_new_store_name)],
+            STORE_URL_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, game_add_new_store_url)],
+            STORE_CONTACT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, game_add_new_store_contact),
+                CommandHandler("skip", game_add_new_store_skip_contact),
+            ],
             USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_username)],
             PASSWORD: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_password),
@@ -1237,14 +1604,6 @@ def main():
             SELLER: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_seller),
                 CommandHandler("skip", skip_seller),
-            ],
-            PRICE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_price),
-                CommandHandler("skip", skip_price),
-            ],
-            WARRANTY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_warranty),
-                CommandHandler("skip", skip_warranty),
             ],
             NOTES: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_notes),
@@ -1299,7 +1658,35 @@ def main():
         fallbacks=menu_fallbacks(),
     )
 
+    add_store_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(store_add_entry, pattern="^store_add$"),
+        ],
+        states={
+            STORE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, store_add_name)],
+            STORE_URL_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, store_add_url)],
+            STORE_CONTACT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, store_add_contact),
+                CommandHandler("skip", store_add_skip_contact),
+            ],
+        },
+        fallbacks=menu_fallbacks(),
+    )
+
+    edit_store_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(store_edit_start_field, pattern="^store_editf_"),
+        ],
+        states={
+            STORE_EDIT_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, store_edit_receive_value),
+            ],
+        },
+        fallbacks=menu_fallbacks(),
+    )
+
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("mylibrary", mylibrary_command))
     app.add_handler(CommandHandler("view", view_command))
     app.add_handler(CommandHandler("search", search_command))
@@ -1311,6 +1698,8 @@ def main():
     app.add_handler(quick_add_conv)
     app.add_handler(edit_conv)
     app.add_handler(search_conv)
+    app.add_handler(add_store_conv)
+    app.add_handler(edit_store_conv)
     app.add_handler(CallbackQueryHandler(button_handler, pattern="^(list|stats|help)$"))
     app.add_handler(CallbackQueryHandler(menu, pattern="^menu$"))
     app.add_handler(CallbackQueryHandler(library_list_handler, pattern="^list_(fav|recent|all)$"))
@@ -1318,10 +1707,17 @@ def main():
     app.add_handler(CallbackQueryHandler(toggle_favorite, pattern="^fav_\\d+$"))
     app.add_handler(CallbackQueryHandler(edit_pick_field, pattern="^edit_\\d+$"))
     app.add_handler(CallbackQueryHandler(delete_game, pattern="^delete_\\d+$"))
+    app.add_handler(CallbackQueryHandler(stores_list_handler, pattern="^stores_list$"))
+    app.add_handler(CallbackQueryHandler(view_store, pattern="^store_view_\\d+$"))
+    app.add_handler(CallbackQueryHandler(store_edit_pick_field, pattern="^store_edit_\\d+$"))
+    app.add_handler(CallbackQueryHandler(delete_store_prompt, pattern="^store_del_\\d+$"))
+    app.add_handler(CallbackQueryHandler(delete_store_confirm, pattern="^store_delok_\\d+$"))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_LIBRARY}$"), handle_menu_library))
+    app.add_handler(MessageHandler(filters.Regex(f"^{MENU_STORES}$"), handle_menu_stores))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_STATS}$"), handle_menu_stats))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_HELP}$"), handle_menu_help))
     app.add_handler(MessageHandler(filters.Regex(f"^{MENU_HOME}$"), handle_menu_home))
+    app.add_handler(MessageHandler(filters.Text([MENU_CANCEL]), cancel_conversation))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_import_file))
 
     if app.job_queue:

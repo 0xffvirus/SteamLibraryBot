@@ -21,13 +21,6 @@ FIELD_PATTERNS = {
     "notes": re.compile(
         r"(?:notes?|note)\s*[:=]\s*(.+)", re.IGNORECASE | re.MULTILINE
     ),
-    "price_paid": re.compile(
-        r"(?:price|cost|paid)\s*[:=]\s*\$?([\d.]+)", re.IGNORECASE | re.MULTILINE
-    ),
-    "warranty_until": re.compile(
-        r"(?:warranty|expires?|expiry)\s*[:=]\s*(\d{4}-\d{2}-\d{2})",
-        re.IGNORECASE | re.MULTILINE,
-    ),
 }
 
 
@@ -55,8 +48,6 @@ def format_quick_add_preview(data):
         "username": "Username",
         "password": "Password",
         "seller_contact": "Seller",
-        "price_paid": "Price",
-        "warranty_until": "Warranty",
         "notes": "Notes",
     }
     for key, label in labels.items():
