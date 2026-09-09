@@ -1571,6 +1571,11 @@ async def warranty_reminder_job(context: ContextTypes.DEFAULT_TYPE):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    if not BOT_TOKEN:
+        raise SystemExit(
+            "❌ BOT_TOKEN is not set. Export it before running:\n"
+            "   export BOT_TOKEN=\"your-token-from-BotFather\""
+        )
     db.init_db()
     app = Application.builder().token(BOT_TOKEN).build()
 
